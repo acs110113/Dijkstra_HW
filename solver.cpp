@@ -137,6 +137,9 @@ static void read_graph(const char* path) {
 static const int64_t INF = std::numeric_limits<int64_t>::max()/4;
 using PQItem = std::pair<int64_t,int32_t>;
 using Heap = std::priority_queue<PQItem,vector<PQItem>,std::greater<PQItem>>;
+struct ReusableHeap : Heap {
+    void clear() { this->c.clear(); }
+};
 static vector<vector<Edge>> radj, up, back;
 static vector<int32_t> rank_id, level, removed_neighbors;
 static vector<int64_t> wd;
@@ -153,6 +156,7 @@ static void new_epoch(vector<uint32_t>& stamps,uint32_t& e) {
 
 static void find_shortcuts(int32_t v,vector<Shortcut>& shortcuts) {
     shortcuts.clear();
+    static ReusableHeap pq;
     // At low degree even retaining every shortcut cannot increase the live
     // edge count. Avoid a potentially long witness search in this case.
     if(adj[v].size()*radj[v].size()<=adj[v].size()+radj[v].size()) {
@@ -173,7 +177,7 @@ static void find_shortcuts(int32_t v,vector<Shortcut>& shortcuts) {
         for(const Edge& b:adj[v]) if(b.to!=s) {
             target_stamp[b.to]=epoch; target_limit[b.to]=a.w+b.w; ++remaining;
         }
-        Heap pq;
+        pq.clear();
         wd[s]=0; ws[s]=epoch; pq.push({0,s});
         int settled=0;
         while(!pq.empty() && settled<160 && remaining) {
@@ -189,6 +193,12 @@ static void find_shortcuts(int32_t v,vector<Shortcut>& shortcuts) {
                     ws[e.to]=epoch; wd[e.to]=nd; pq.push({nd,e.to});
                     if(target_stamp[e.to]==epoch && nd<=target_limit[e.to]) {
                         target_stamp[e.to]=0; --remaining;
+                        if(target_limit[e.to]==limit) {
+                            limit=0;
+                            for(const Edge& target:adj[v])
+                                if(target_stamp[target.to]==epoch)
+                                    limit=std::max(limit,target_limit[target.to]);
+                        }
                     }
                 }
             }
@@ -215,9 +225,6 @@ static void add_arc(int32_t u,int32_t v,int64_t w) {
 // Each unordered neighbor pair needs one witness, not two identical searches.
 // The original directed implementation below remains available unchanged.
 static bool symmetric_hierarchy=false;
-struct ReusableHeap : Heap {
-    void clear() { this->c.clear(); }
-};
 static uint64_t witness_calls=0, witness_caps=0, witness_scans=0;
 static uint64_t priority_checks=0, priority_requeues=0;
 static uint64_t shortcuts_added=0, pruned_arcs=0;
