@@ -283,6 +283,14 @@ static void symmetric_shortcuts(int32_t v, vector<Shortcut>& candidates,
                     ws[e.to]=epoch;wd[e.to]=nd;pq.push({nd,e.to});
                     if(target_stamp[e.to]==epoch && nd<=target_limit[e.to]) {
                         target_stamp[e.to]=0;--remaining;
+                        if(target_limit[e.to]==limit) {
+                            limit=0;
+                            for(size_t j=i+1;j<degree;++j) {
+                                int32_t target=neighbors[j].to;
+                                if(target_stamp[target]==epoch)
+                                    limit=std::max(limit,target_limit[target]);
+                            }
+                        }
                     }
                 }
             }
@@ -544,22 +552,88 @@ static int64_t dijkstra(int32_t s,int32_t t) {
     return best==INF?-1:best;
 }
 
+
+// V3: cache upward Dijkstra distances when many queries amortize the work.
+// Every label is computed from this invocation's graph. Intersecting the two
+// upward searches is the same exact meeting criterion as the CH query above.
+static vector<vector<Edge>> query_labels[2];
+static bool build_query_labels(int32_t queries) {
+    if(plain_bidirectional || V>150000 || int64_t(queries)<4LL*V) return false;
+    for(int32_t u=0;u<V;++u) if(rank_id[u]>=V) return false;
+    const size_t entry_cap=24000000,scan_cap=200000000;
+    size_t entries=0,scans=0;
+    vector<int64_t> distance(V);
+    vector<uint32_t> stamp(V,0);
+    uint32_t generation=0;
+    vector<int32_t> descending(V),touched;
+    for(int32_t u=0;u<V;++u) descending[rank_id[u]]=u;
+    for(int side=0;side<(symmetric_hierarchy?1:2);++side) {
+        query_labels[side].resize(V);
+        const auto& graph=side?back:up;
+        for(int32_t rank=V-1;rank>=0;--rank) {
+            const int32_t source=descending[rank];
+            ++generation;touched.clear();distance[source]=0;stamp[source]=generation;
+            touched.push_back(source);
+            for(const Edge& edge:graph[source]) {
+                for(const Edge& entry:query_labels[side][edge.to]) {
+                    if(++scans>scan_cap) goto fallback;
+                    const int64_t nd=edge.w+entry.w;
+                    if(stamp[entry.to]!=generation) {
+                        stamp[entry.to]=generation;distance[entry.to]=nd;
+                        touched.push_back(entry.to);
+                    } else distance[entry.to]=std::min(distance[entry.to],nd);
+                }
+            }
+            entries+=touched.size();
+            if(entries>entry_cap) goto fallback;
+            std::sort(touched.begin(),touched.end());
+            auto& label=query_labels[side][source];label.reserve(touched.size());
+            for(int32_t u:touched) label.push_back({u,distance[u]});
+        }
+    }
+#ifdef PROFILE
+    std::fprintf(stderr,"[profile] labels entries=%zu scans=%zu\n",entries,scans);
+#endif
+    return true;
+fallback:
+    for(auto& labels:query_labels) vector<vector<Edge>>().swap(labels);
+#ifdef PROFILE
+    std::fprintf(stderr,"[profile] labels budget reached; using CH queries\n");
+#endif
+    return false;
+}
+static int64_t label_query(int32_t s,int32_t t) {
+    const auto& a=query_labels[0][s];
+    const auto& b=query_labels[symmetric_hierarchy?0:1][t];
+    size_t i=0,j=0;int64_t best=INF;
+    while(i<a.size() && j<b.size()) {
+        if(a[i].to<b[j].to) ++i;
+        else if(a[i].to>b[j].to) ++j;
+        else {best=std::min(best,a[i].w+b[j].w);++i;++j;}
+    }
+    return best==INF?-1:best;
+}
+
 static void run_queries(const char* qpath, const char* opath) {
     std::FILE* qf = std::fopen(qpath, "r");
     if (!qf) { std::fprintf(stderr, "cannot open query file: %s\n", qpath); std::exit(1); }
     std::FILE* of = std::fopen(opath, "w");
     if (!of) { std::fprintf(stderr, "cannot open output file: %s\n", opath); std::exit(1); }
 
+    GraphInput input(qf);
     int32_t Q;
-    if (std::fscanf(qf, "%d", &Q) != 1) {
+    if (!input.integer(Q)) {
         std::fprintf(stderr, "bad query header\n"); std::exit(1);
     }
+    const bool labeled=build_query_labels(Q);
+    char output_buffer[1<<16];
+    std::setvbuf(of,output_buffer,_IOFBF,sizeof(output_buffer));
     for (int32_t i = 0; i < Q; ++i) {
         int32_t s, t;
-        if (std::fscanf(qf, "%d %d", &s, &t) != 2) {
+        if (!input.integer(s) || !input.integer(t)) {
             std::fprintf(stderr, "bad query %d\n", i); std::exit(1);
         }
-        int64_t d = dijkstra(s, t);
+        int64_t d = labeled?label_query(s,t):dijkstra(s, t);
         std::fprintf(of, "%lld\n", (long long)d);
     }
     std::fclose(qf);
