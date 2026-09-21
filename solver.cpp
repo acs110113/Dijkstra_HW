@@ -141,12 +141,36 @@ struct ReusableHeap : Heap {
     void clear() { this->c.clear(); }
 };
 static vector<vector<Edge>> radj, up, back;
+
+// Contiguous query adjacency retains the same arcs and vertex IDs.
+struct EdgeRange {
+    const Edge* first;const Edge* last;
+    const Edge* begin() const {return first;}
+    const Edge* end() const {return last;}
+};
+struct PackedGraph {
+    vector<size_t> offsets;
+    vector<Edge> edges;
+    void pack(vector<vector<Edge>>& lists) {
+        offsets.assign(size_t(V)+1,0);
+        for(size_t u=0;u<lists.size();++u) offsets[u+1]=offsets[u]+lists[u].size();
+        edges.reserve(offsets.back());
+        for(const auto& es:lists) edges.insert(edges.end(),es.begin(),es.end());
+        vector<vector<Edge>>().swap(lists);
+    }
+    EdgeRange operator[](int32_t u) const {
+        static const Edge dummy={0,0};
+        const Edge* p=edges.empty()?&dummy:edges.data();
+        return {p+offsets[u],p+offsets[u+1]};
+    }
+};
+static PackedGraph packed_up,packed_back;
 static vector<int32_t> rank_id, level, removed_neighbors;
 static vector<int64_t> wd;
 static vector<uint32_t> ws;
 static vector<uint32_t> target_stamp;
 static vector<int64_t> target_limit;
-static bool plain_bidirectional=false;
+static bool partial_core=false;
 static uint32_t epoch=0;
 struct Shortcut { int32_t from,to; int64_t w; };
 
@@ -154,9 +178,41 @@ static void new_epoch(vector<uint32_t>& stamps,uint32_t& e) {
     if (++e==0) { std::fill(stamps.begin(),stamps.end(),0); e=1; }
 }
 
+// Four-way minimum heap for preprocessing and queries. Pair ordering is
+// identical to std::priority_queue; only its storage/maintenance changes.
+class MinHeap4 {
+    vector<PQItem> data;
+public:
+    bool empty() const {return data.empty();}
+    size_t size() const {return data.size();}
+    void clear() {data.clear();}
+    const PQItem& top() const {return data.front();}
+    void push(PQItem item) {
+        size_t i=data.size();data.push_back(item);
+        while(i) {
+            size_t parent=(i-1)/4;
+            if(!(item<data[parent])) break;
+            data[i]=data[parent];i=parent;
+        }
+        data[i]=item;
+    }
+    void pop() {
+        PQItem item=data.back();data.pop_back();
+        if(data.empty()) return;
+        size_t i=0;
+        while(4*i+1<data.size()) {
+            size_t child=4*i+1;
+            const size_t end=std::min(child+4,data.size());
+            for(size_t j=child+1;j<end;++j) if(data[j]<data[child]) child=j;
+            if(!(data[child]<item)) break;
+            data[i]=data[child];i=child;
+        }
+        data[i]=item;
+    }
+};
 static void find_shortcuts(int32_t v,vector<Shortcut>& shortcuts) {
     shortcuts.clear();
-    static ReusableHeap pq;
+    static MinHeap4 pq;
     // At low degree even retaining every shortcut cannot increase the live
     // edge count. Avoid a potentially long witness search in this case.
     if(adj[v].size()*radj[v].size()<=adj[v].size()+radj[v].size()) {
@@ -223,7 +279,7 @@ static void add_arc(int32_t u,int32_t v,int64_t w) {
 
 // Version 2: exploit the symmetry of undirected inputs throughout contraction.
 // Each unordered neighbor pair needs one witness, not two identical searches.
-// The original directed implementation below remains available unchanged.
+// Directed inputs retain separate forward and backward adjacency.
 static bool symmetric_hierarchy=false;
 static uint64_t witness_calls=0, witness_caps=0, witness_scans=0;
 static uint64_t priority_checks=0, priority_requeues=0;
@@ -246,7 +302,7 @@ static void add_undirected_edge(int32_t u,int32_t v,int64_t w) {
 }
 
 static void symmetric_shortcuts(int32_t v, vector<Shortcut>& candidates,
-                               ReusableHeap& pq) {
+                               MinHeap4& pq) {
     candidates.clear();
     const auto& neighbors=adj[v];
     const size_t degree=neighbors.size();
@@ -332,7 +388,7 @@ static void prepare_undirected() {
     for(const auto& es:adj) for(const Edge& e:es) {
         ++arc_count_all;if(e.w<max_weight/100) ++small_count;
     }
-    ReusableHeap pq;
+    MinHeap4 pq;
 #ifdef PROFILE
     auto pruning_start=std::chrono::steady_clock::now();
 #endif
@@ -365,15 +421,23 @@ static void prepare_undirected() {
         static_cast<unsigned long long>(pruned_arcs));
     auto contraction_start=std::chrono::steady_clock::now();
 #endif
+    // Broad weight distributions benefit from a cheap fill upper bound.
+    // This only chooses the order; every chosen node still gets a full,
+    // bounded witness search before any edges are removed.
+    const bool cheap_order=small_count>arc_count_all/4;
+    auto estimate=[&](int32_t v) {
+        int64_t d=adj[v].size();
+        return (d<=4?20*(d*(d-1)/2-d):-20*d)+2*level[v]+removed_neighbors[v];
+    };
     Heap order;
-    for(int32_t v=0;v<V;++v) order.push({-20*int64_t(adj[v].size()),v});
+    for(int32_t v=0;v<V;++v) order.push({cheap_order?estimate(v):-20*int64_t(adj[v].size()),v});
     vector<Shortcut> candidates;
     vector<unsigned char> deferred(V,0);
     int32_t next_rank=0;
     auto wake=[&](int32_t u) {
         if(deferred[u] && adj[u].size()*adj[u].size()<=20000) {
             deferred[u]=0;
-            order.push({-20*int64_t(adj[u].size())+2*level[u]+removed_neighbors[u],u});
+            order.push({cheap_order?estimate(u):-20*int64_t(adj[u].size())+2*level[u]+removed_neighbors[u],u});
         }
     };
     // Save one complete witness result. It can be reused only if NO node was
@@ -384,6 +448,13 @@ static void prepare_undirected() {
         if(rank_id[v]>=0) continue;
         const size_t d=adj[v].size();
         if(d*d>20000) {deferred[v]=1;continue;}
+        if(cheap_order && d<=4) {
+            const int64_t priority=estimate(v);
+            if(!order.empty() && priority>order.top().first) {
+                order.push({priority,v});++priority_requeues;continue;
+            }
+            symmetric_shortcuts(v,candidates,pq);++priority_checks;
+        } else {
         if(cached_v!=v || cached_rank!=next_rank) {
             symmetric_shortcuts(v,candidates,pq);++priority_checks;
             cached_v=v;cached_rank=next_rank;
@@ -392,6 +463,7 @@ static void prepare_undirected() {
                               +2*level[v]+removed_neighbors[v];
         if(!order.empty() && priority>order.top().first) {
             order.push({priority,v});++priority_requeues;continue;
+        }
         }
         rank_id[v]=next_rank++;
         up[v]=std::move(adj[v]);
@@ -421,18 +493,104 @@ static void prepare_undirected() {
 #endif
 }
 
+
+// Sparse directed inputs: eliminate low-degree vertices with at most eight
+// candidate shortcuts per elimination. No witness search is needed. Both
+// the complete shortcut set and the rank are retained for exact queries.
+static void prepare_sparse_core() {
+    partial_core=true;
+    up.resize(V);back.resize(V);radj.resize(V);rank_id.assign(V,V);
+    for(int32_t u=0;u<V;++u) {
+        auto& es=adj[u];
+        std::sort(es.begin(),es.end(),[](const Edge&a,const Edge&b){return a.to<b.to || (a.to==b.to && a.w<b.w);});
+        size_t n=0;
+        for(size_t i=0;i<es.size();++i)
+            if(es[i].to!=u && (!n || es[n-1].to!=es[i].to)) es[n++]=es[i];
+        es.resize(n);
+        for(const Edge& e:es) radj[e.to].push_back({u,e.w});
+    }
+    std::queue<int32_t> pending;
+    vector<unsigned char> queued(V,0);
+    auto eligible=[&](int32_t v) {
+        size_t a=adj[v].size(),b=radj[v].size();
+        return rank_id[v]==V && a+b<=32 && a*b<=8;
+    };
+    auto enqueue=[&](int32_t v) {
+        if(!queued[v] && eligible(v)) {queued[v]=1;pending.push(v);}
+    };
+    for(int32_t v=0;v<V;++v) enqueue(v);
+    int32_t next_rank=0;
+    while(!pending.empty()) {
+        int32_t v=pending.front();pending.pop();queued[v]=0;
+        if(!eligible(v)) continue;
+        rank_id[v]=next_rank++;
+        up[v]=std::move(adj[v]);back[v]=std::move(radj[v]);
+        for(const Edge& e:up[v]) erase_neighbor(radj[e.to],v);
+        for(const Edge& e:back[v]) erase_neighbor(adj[e.to],v);
+        for(const Edge& a:back[v]) for(const Edge& b:up[v])
+            if(a.to!=b.to) add_arc(a.to,b.to,a.w+b.w);
+        for(const Edge& e:up[v]) enqueue(e.to);
+        for(const Edge& e:back[v]) enqueue(e.to);
+    }
+    for(int32_t v=0;v<V;++v) if(rank_id[v]==V) {
+        up[v]=std::move(adj[v]);back[v]=std::move(radj[v]);
+    }
+    vector<vector<Edge>>().swap(adj);vector<vector<Edge>>().swap(radj);
+#ifdef PROFILE
+    std::fprintf(stderr,"[profile] sparse contracted=%d core=%d\n",next_rank,V-next_rank);
+#endif
+}
+
+// Finish both acyclic fringes before using the ordinary bidirectional
+// stopping rule inside the residual core. A CH-wide min-sum rule is unsafe.
+static int64_t sparse_query(int32_t s,int32_t t) {
+    static vector<int64_t> dist[2];
+    static vector<uint32_t> seen[2];
+    static uint32_t generation=0;
+    if(dist[0].empty()) for(int k=0;k<2;++k) {dist[k].resize(V);seen[k].assign(V,0);}
+    if(++generation==0) {for(auto& a:seen) std::fill(a.begin(),a.end(),0);generation=1;}
+    static MinHeap4 core[2],fringe;
+    core[0].clear();core[1].clear();
+    int64_t best=INF;
+    dist[0][s]=dist[1][t]=0;seen[0][s]=seen[1][t]=generation;
+    for(int k=0;k<2;++k) {
+        fringe.clear();int32_t start=k?t:s;
+        if(rank_id[start]==V) core[k].push({0,start});else fringe.push({0,start});
+        while(!fringe.empty()) {
+            auto [d,u]=fringe.top();fringe.pop();
+            if(d!=dist[k][u] || d>=best) continue;
+            if(seen[1-k][u]==generation) best=std::min(best,d+dist[1-k][u]);
+            for(const Edge& e:(k?packed_back[u]:packed_up[u])) {
+                int64_t nd=d+e.w;if(nd>=best) continue;
+                if(seen[k][e.to]!=generation || nd<dist[k][e.to]) {
+                    seen[k][e.to]=generation;dist[k][e.to]=nd;
+                    if(rank_id[e.to]==V) core[k].push({nd,e.to});else fringe.push({nd,e.to});
+                    if(seen[1-k][e.to]==generation) best=std::min(best,nd+dist[1-k][e.to]);
+                }
+            }
+        }
+    }
+    while(!core[0].empty() && !core[1].empty()) {
+        if(core[0].top().first+core[1].top().first>=best) break;
+        int k=core[1].size()<core[0].size();
+        auto [d,u]=core[k].top();core[k].pop();
+        if(d!=dist[k][u]) continue;
+        if(seen[1-k][u]==generation) best=std::min(best,d+dist[1-k][u]);
+        for(const Edge& e:(k?packed_back[u]:packed_up[u])) {
+            int64_t nd=d+e.w;if(nd>=best) continue;
+            if(seen[k][e.to]!=generation || nd<dist[k][e.to]) {
+                seen[k][e.to]=generation;dist[k][e.to]=nd;core[k].push({nd,e.to});
+                if(seen[1-k][e.to]==generation) best=std::min(best,nd+dist[1-k][e.to]);
+            }
+        }
+    }
+    return best==INF?-1:best;
+}
+
 static void prepare_graph() {
     if(!(FLAGS & FLAG_DIRECTED)) {prepare_undirected();return;}
     radj.resize(V); up.resize(V); back.resize(V);
-    // Very sparse directed graphs benefit from meeting in the middle without
-    // the up-front cost of a hierarchy. This choice changes only performance.
-    plain_bidirectional=(FLAGS&FLAG_DIRECTED) && int64_t(E)<=4LL*V;
-    if(plain_bidirectional) {
-        up=std::move(adj);
-        for(int32_t u=0;u<V;++u) for(const Edge&e:up[u]) back[e.to].push_back({u,e.w});
-        vector<vector<Edge>>().swap(radj);
-        return;
-    }
+    if(int64_t(E)<=4LL*V) {prepare_sparse_core();return;}
     rank_id.assign(V,-1); level.assign(V,0); removed_neighbors.assign(V,0);
     wd.resize(V); ws.assign(V,0);
     target_stamp.assign(V,0); target_limit.resize(V);
@@ -521,32 +679,30 @@ static void prepare_graph() {
 // frontier's minimum, which is not a valid stopping rule for CH queries).
 static int64_t dijkstra(int32_t s,int32_t t) {
     if(s==t) return 0;
+    if(partial_core) return sparse_query(s,t);
     static vector<int64_t> dist[2];
     static vector<uint32_t> seen[2];
     static uint32_t generation=0;
     if(dist[0].empty()) for(int k=0;k<2;++k) {dist[k].resize(V);seen[k].assign(V,0);}
     if(++generation==0) {for(auto& a:seen) std::fill(a.begin(),a.end(),0); generation=1;}
-    static ReusableHeap pq[2];
+    static MinHeap4 pq[2];
     pq[0].clear();pq[1].clear();
     dist[0][s]=dist[1][t]=0;
     seen[0][s]=seen[1][t]=generation;
     pq[0].push({0,s}); pq[1].push({0,t});
     int64_t best=INF;
     while(!pq[0].empty() || !pq[1].empty()) {
-        if(plain_bidirectional && (pq[0].empty() || pq[1].empty() ||
-           pq[0].top().first+pq[1].top().first>=best)) break;
         for(int k=0;k<2;++k) if(!pq[k].empty() && pq[k].top().first>=best) pq[k].clear();
         if(pq[0].empty() && pq[1].empty()) break;
         int k=pq[0].empty()?1:pq[1].empty()?0:(pq[1].top().first<pq[0].top().first);
-        if(plain_bidirectional) k=pq[1].size()<pq[0].size();
         auto [d,u]=pq[k].top(); pq[k].pop();
         if(d!=dist[k][u]) continue;
         if(seen[1-k][u]==generation) best=std::min(best,d+dist[1-k][u]);
-        const auto& incoming=symmetric_hierarchy?up[u]:(k?up[u]:back[u]);
+        const auto incoming=symmetric_hierarchy?packed_up[u]:(k?packed_up[u]:packed_back[u]);
         bool stalled=false;
         for(const Edge&e:incoming) if(seen[k][e.to]==generation && dist[k][e.to]+e.w<d) {stalled=true;break;}
         if(stalled) continue;
-        const auto& outgoing=symmetric_hierarchy?up[u]:(k?back[u]:up[u]);
+        const auto& outgoing=symmetric_hierarchy?packed_up[u]:(k?packed_back[u]:packed_up[u]);
         for(const Edge&e:outgoing) {
             int64_t nd=d+e.w;
             if(nd>=best) continue;
@@ -563,9 +719,12 @@ static int64_t dijkstra(int32_t s,int32_t t) {
 // V3: cache upward Dijkstra distances when many queries amortize the work.
 // Every label is computed from this invocation's graph. Intersecting the two
 // upward searches is the same exact meeting criterion as the CH query above.
-static vector<vector<Edge>> query_labels[2];
+// Compact only cached labels, after checking every stored distance. Path
+// arithmetic and output stay 64-bit; larger values use ordinary exact queries.
+struct LabelEntry {int32_t to;uint32_t w;};
+static vector<vector<LabelEntry>> query_labels[2];
 static bool build_query_labels(int32_t queries) {
-    if(plain_bidirectional || V>150000 || int64_t(queries)<4LL*V) return false;
+    if(partial_core || V>150000 || int64_t(queries)<4LL*V) return false;
     for(int32_t u=0;u<V;++u) if(rank_id[u]>=V) return false;
     const size_t entry_cap=24000000,scan_cap=200000000;
     size_t entries=0,scans=0;
@@ -576,13 +735,13 @@ static bool build_query_labels(int32_t queries) {
     for(int32_t u=0;u<V;++u) descending[rank_id[u]]=u;
     for(int side=0;side<(symmetric_hierarchy?1:2);++side) {
         query_labels[side].resize(V);
-        const auto& graph=side?back:up;
+        const auto& graph=side?packed_back:packed_up;
         for(int32_t rank=V-1;rank>=0;--rank) {
             const int32_t source=descending[rank];
             ++generation;touched.clear();distance[source]=0;stamp[source]=generation;
             touched.push_back(source);
             for(const Edge& edge:graph[source]) {
-                for(const Edge& entry:query_labels[side][edge.to]) {
+                for(const LabelEntry& entry:query_labels[side][edge.to]) {
                     if(++scans>scan_cap) goto fallback;
                     const int64_t nd=edge.w+entry.w;
                     if(stamp[entry.to]!=generation) {
@@ -595,7 +754,10 @@ static bool build_query_labels(int32_t queries) {
             if(entries>entry_cap) goto fallback;
             std::sort(touched.begin(),touched.end());
             auto& label=query_labels[side][source];label.reserve(touched.size());
-            for(int32_t u:touched) label.push_back({u,distance[u]});
+            for(int32_t u:touched) {
+                if(distance[u]>std::numeric_limits<uint32_t>::max()) goto fallback;
+                label.push_back({u,static_cast<uint32_t>(distance[u])});
+            }
         }
     }
 #ifdef PROFILE
@@ -603,7 +765,7 @@ static bool build_query_labels(int32_t queries) {
 #endif
     return true;
 fallback:
-    for(auto& labels:query_labels) vector<vector<Edge>>().swap(labels);
+    for(auto& labels:query_labels) vector<vector<LabelEntry>>().swap(labels);
 #ifdef PROFILE
     std::fprintf(stderr,"[profile] labels budget reached; using CH queries\n");
 #endif
@@ -616,7 +778,7 @@ static int64_t label_query(int32_t s,int32_t t) {
     while(i<a.size() && j<b.size()) {
         if(a[i].to<b[j].to) ++i;
         else if(a[i].to>b[j].to) ++j;
-        else {best=std::min(best,a[i].w+b[j].w);++i;++j;}
+        else {best=std::min(best,int64_t(a[i].w)+b[j].w);++i;++j;}
     }
     return best==INF?-1:best;
 }
@@ -661,6 +823,7 @@ int main(int argc, char** argv) {
     auto phase=std::chrono::steady_clock::now();
 #endif
     prepare_graph();
+    packed_up.pack(up);packed_back.pack(back);
 #ifdef PROFILE
     std::fprintf(stderr,"preprocess %.3f s\n",std::chrono::duration<double>(std::chrono::steady_clock::now()-phase).count());
 #endif
